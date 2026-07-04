@@ -18,9 +18,9 @@ project "box3d"
   }
 
 files {
-  "include/**.h"
-  "src/**.c"
-  "src/**.cpp"
+  "include/**.h",
+  "src/**.c",
+  "src/**.cpp",
   "src/**.h"
 }
 
