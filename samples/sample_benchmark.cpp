@@ -30,6 +30,8 @@ public:
 			m_camera->SetView( 40.0f, -10.0f, 110.0f, { 0.0f, 40.0f, 0.0f } );
 		}
 
+		m_shadowSplitFar = 180.0f;
+
 		CreateLargePyramid( m_worldId );
 
 		SetGroundShape( GetGroundShapeId() );
@@ -632,13 +634,13 @@ public:
 		}
 
 		float milliseconds = b3GetMilliseconds( startTick );
-		uint64_t tickCount = b3GetTicks() - startTick;
+		int tickCount = (int)(b3GetTicks() - startTick);
 		float aveIterations = float( iterationCount ) / float( castCount );
 		float aveInner = float( innerIterationCount ) / float( castCount );
 
 		float aveCastTime = 1000.0f * milliseconds / float( castCount );
 
-		DrawTextLine( "count = %d, hit count = %d, iterations = %d, inner = %d, ticks = %ld", castCount, hitCount, iterationCount,
+		DrawTextLine( "count = %d, hit count = %d, iterations = %d, inner = %d, ticks = %d", castCount, hitCount, iterationCount,
 					  innerIterationCount, tickCount );
 
 		DrawTextLine( "ave iterations = %.1f, ave inner = %.1f, ave cast us %.3f", aveIterations, aveInner, aveCastTime );
@@ -1034,13 +1036,12 @@ public:
 
 		g_randomSeed = 42;
 
-		m_count = 64;
-		for ( int i = 0; i < m_count; ++i )
+		for ( int i = 0; i < m_capacity; ++i )
 		{
 			m_points[i] = RandomVec3( { -1.0f, -1.0f, -1.0f }, { 1.0f, 1.0f, 1.0f } );
 		}
 
-		m_hull = b3CreateHull( m_points, m_count, m_count );
+		m_hull = b3CreateHull( m_points, m_capacity, m_count );
 		m_scale = { -1.0f, 1.0f, 1.0f };
 		m_transformedHull = b3CloneAndTransformHull( m_hull, b3Transform_identity, m_scale );
 	}
@@ -1070,7 +1071,7 @@ public:
 
 		for ( int i = 0; i < trials; ++i )
 		{
-			b3HullData* hull = b3CreateHull( m_points, m_count, m_count );
+			b3HullData* hull = b3CreateHull( m_points, m_capacity, m_count );
 			area += hull->surfaceArea;
 			b3DestroyHull( hull );
 		}
@@ -1099,12 +1100,12 @@ public:
 		return new BenchmarkHull( sampleContext );
 	}
 
-	static constexpr int m_capacity = 64;
+	static constexpr int m_capacity = 100;
+	static constexpr int m_count = 16;
 	b3HullData* m_hull;
 	b3HullData* m_transformedHull;
 	b3Vec3 m_scale;
 	b3Vec3 m_points[m_capacity];
-	int m_count;
 };
 
 static int sampleBenchmarkHull = RegisterSample( "Benchmark", "Hull", BenchmarkHull::Create );
@@ -1427,6 +1428,10 @@ public:
 			GetGuiDraw()->drawJoints = false;
 		}
 
+		b3Capacity capacity = {};
+		GetJunkyardCapacity( &capacity );
+		CreateWorld( &capacity );
+
 		CreateJunkyard( m_worldId );
 
 		SetGroundShape( GetGroundShapeId() );
@@ -1449,3 +1454,35 @@ public:
 };
 
 static int sampleJunkyard = RegisterSample( "Benchmark", "Junkyard", BenchmarkJunkyard::Create );
+
+class BenchmarkConvexPile : public Sample
+{
+public:
+	explicit BenchmarkConvexPile( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 45.0f, 20.0f, 150.0f, { 0.0f, 15.0f, 0.0f } );
+		}
+
+		// Watched from 150 m out, so the settled pile sits between 100 and 180 m
+		// of view depth and the guessed range stops less than halfway into it.
+		m_shadowSplitFar = 180.0f;
+
+		b3Capacity capacity = {};
+		GetConvexPileCapacity( &capacity );
+		CreateWorld( &capacity );
+
+		CreateConvexPile( m_worldId );
+
+		SetGroundShape( GetGroundShapeId() );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new BenchmarkConvexPile( context );
+	}
+};
+
+static int sampleConvexPile = RegisterSample( "Benchmark", "Convex Pile", BenchmarkConvexPile::Create );

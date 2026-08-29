@@ -15,6 +15,7 @@
 #include "gfx/renderer.h"
 #include "gfx/shadow.h"
 #include "gfx/text.h"
+#include "host/gui.h"
 #include "human.h"
 #include "imgui.h"
 #include "implot.h"
@@ -44,18 +45,34 @@ static char* ReadFile( int& size, const char* filename )
 	}
 
 	fseek( file, 0, SEEK_END );
-	size = static_cast<int>( ftell( file ) );
+	long length = ftell( file );
 	fseek( file, 0, SEEK_SET );
 
-	if ( size == 0 )
+	if ( length <= 0 )
 	{
 		fclose( file );
 		return nullptr;
 	}
 
+	size = static_cast<int>( length );
+
 	char* data = (char*)malloc( size + 1 );
-	fread( data, size, 1, file );
+	if ( data == nullptr )
+	{
+		fclose( file );
+		return nullptr;
+	}
+
+	// Short read means a truncated or racing file, so treat it as no file at all
+	size_t read = fread( data, 1, size, file );
 	fclose( file );
+
+	if ( read != (size_t)size )
+	{
+		free( data );
+		return nullptr;
+	}
+
 	data[size] = 0;
 
 	return data;
@@ -93,14 +110,13 @@ void SampleContext::Save()
 	fprintf( file, "{\n" );
 	fprintf( file, "  \"sampleIndex\": %d,\n", sampleIndex );
 	fprintf( file, "  \"drawShapes\": %s,\n", gd->drawShapes ? "true" : "false" );
-	fprintf( file, "  \"drawJoints\": %s,\n", gd->drawJoints ? "true" : "false" );
-	fprintf( file, "  \"drawContacts\": %s,\n", gd->drawContacts ? "true" : "false" );
 	fprintf( file, "  \"enableShadows\": %s,\n", enableShadows ? "true" : "false" );
 	fprintf( file, "  \"enableGtao\": %s,\n", enableGtao ? "true" : "false" );
 	fprintf( file, "  \"gtaoQuality\": %d,\n", gtaoQuality );
 	fprintf( file, "  \"enableIbl\": %s,\n", GetIblEnabled() ? "true" : "false" );
 	fprintf( file, "  \"exposure\": %g,\n", GetExposure() );
 	fprintf( file, "  \"sunStrength\": %g,\n", GetSun().strength );
+	fprintf( file, "  \"shadowSplitLambda\": %g,\n", GetShadowSplitLambda() );
 	fprintf( file, "  \"debugView\": %d,\n", debugView );
 	fprintf( file, "  \"drawDistance\": %g,\n", drawDistance );
 	fprintf( file, "  \"showHullEdges\": %s,\n", GetEdgeOverlayParams().showHulls ? "true" : "false" );
@@ -123,6 +139,34 @@ static int jsoneq( const char* json, jsmntok_t* tok, const char* s )
 	return -1;
 }
 
+// Tokens are not terminated, so copy before handing one to strtof or strtol.
+// The settings file is hand editable, so truncate a long token rather than
+// trusting it to fit.
+static void CopyToken( char* buffer, int capacity, const char* json, const jsmntok_t& tok )
+{
+	int count = tok.end - tok.start;
+	if ( count > capacity - 1 )
+	{
+		count = capacity - 1;
+	}
+	memcpy( buffer, json + tok.start, count );
+	buffer[count] = 0;
+}
+
+static float ParseFloat( const char* json, const jsmntok_t& tok )
+{
+	char buffer[32];
+	CopyToken( buffer, (int)sizeof( buffer ), json, tok );
+	return strtof( buffer, nullptr );
+}
+
+static int ParseInt( const char* json, const jsmntok_t& tok )
+{
+	char buffer[32];
+	CopyToken( buffer, (int)sizeof( buffer ), json, tok );
+	return (int)strtol( buffer, nullptr, 10 );
+}
+
 void SampleContext::Load()
 {
 	recycleDistance = B3_CONTACT_RECYCLE_DISTANCE;
@@ -143,19 +187,12 @@ void SampleContext::Load()
 	jsmn_init( &parser );
 
 	int tokenCount = jsmn_parse( &parser, data, size, tokens, MAX_TOKENS );
-	char buffer[32];
 
 	for ( int i = 0; i < tokenCount; ++i )
 	{
 		if ( jsoneq( data, &tokens[i], "sampleIndex" ) == 0 )
 		{
-			int count = tokens[i + 1].end - tokens[i + 1].start;
-			assert( count < 32 );
-			const char* s = data + tokens[i + 1].start;
-			strncpy( buffer, s, count );
-			buffer[count] = 0;
-			char* dummy;
-			sampleIndex = (int)strtol( buffer, &dummy, 10 );
+			sampleIndex = ParseInt( data, tokens[i + 1] );
 
 			if ( sampleIndex < 0 )
 			{
@@ -171,16 +208,6 @@ void SampleContext::Load()
 			const char* s = data + tokens[i + 1].start;
 			GetGuiDraw()->drawShapes = strncmp( s, "true", 4 ) == 0;
 		}
-		else if ( jsoneq( data, &tokens[i], "drawJoints" ) == 0 )
-		{
-			const char* s = data + tokens[i + 1].start;
-			GetGuiDraw()->drawJoints = strncmp( s, "true", 4 ) == 0;
-		}
-		else if ( jsoneq( data, &tokens[i], "drawContacts" ) == 0 )
-		{
-			const char* s = data + tokens[i + 1].start;
-			GetGuiDraw()->drawContacts = strncmp( s, "true", 4 ) == 0;
-		}
 		else if ( jsoneq( data, &tokens[i], "enableShadows" ) == 0 )
 		{
 			const char* s = data + tokens[i + 1].start;
@@ -193,12 +220,7 @@ void SampleContext::Load()
 		}
 		else if ( jsoneq( data, &tokens[i], "gtaoQuality" ) == 0 )
 		{
-			int count = tokens[i + 1].end - tokens[i + 1].start;
-			assert( count < 32 );
-			const char* s = data + tokens[i + 1].start;
-			strncpy( buffer, s, count );
-			buffer[count] = 0;
-			int quality = b3ClampInt( (int)strtol( buffer, nullptr, 10 ), 0, 2 );
+			int quality = b3ClampInt( ParseInt( data, tokens[i + 1] ), 0, 2 );
 
 			GtaoTraceParams p = GetGtaoTraceParams();
 			p.quality = (AmbientOcclusionQuality)quality;
@@ -211,41 +233,25 @@ void SampleContext::Load()
 		}
 		else if ( jsoneq( data, &tokens[i], "exposure" ) == 0 )
 		{
-			int count = tokens[i + 1].end - tokens[i + 1].start;
-			assert( count < 32 );
-			const char* s = data + tokens[i + 1].start;
-			strncpy( buffer, s, count );
-			buffer[count] = 0;
-			SetExposure( strtof( buffer, nullptr ) );
+			SetExposure( ParseFloat( data, tokens[i + 1] ) );
 		}
 		else if ( jsoneq( data, &tokens[i], "sunStrength" ) == 0 )
 		{
-			int count = tokens[i + 1].end - tokens[i + 1].start;
-			assert( count < 32 );
-			const char* s = data + tokens[i + 1].start;
-			strncpy( buffer, s, count );
-			buffer[count] = 0;
 			Sun sun = GetSun();
-			sun.strength = strtof( buffer, nullptr );
+			sun.strength = ParseFloat( data, tokens[i + 1] );
 			SetSun( sun );
+		}
+		else if ( jsoneq( data, &tokens[i], "shadowSplitLambda" ) == 0 )
+		{
+			SetShadowSplitLambda( ParseFloat( data, tokens[i + 1] ) );
 		}
 		else if ( jsoneq( data, &tokens[i], "debugView" ) == 0 )
 		{
-			int count = tokens[i + 1].end - tokens[i + 1].start;
-			assert( count < 32 );
-			const char* s = data + tokens[i + 1].start;
-			strncpy( buffer, s, count );
-			buffer[count] = 0;
-			debugView = b3ClampInt( (int)strtol( buffer, nullptr, 10 ), 0, 4 );
+			debugView = b3ClampInt( ParseInt( data, tokens[i + 1] ), 0, 4 );
 		}
 		else if ( jsoneq( data, &tokens[i], "drawDistance" ) == 0 )
 		{
-			int count = tokens[i + 1].end - tokens[i + 1].start;
-			assert( count < 32 );
-			const char* s = data + tokens[i + 1].start;
-			strncpy( buffer, s, count );
-			buffer[count] = 0;
-			drawDistance = b3ClampFloat( strtof( buffer, nullptr ), 1.0f, Camera::kViewDistance );
+			drawDistance = b3ClampFloat( ParseFloat( data, tokens[i + 1] ), 1.0f, Camera::kViewDistance );
 		}
 		else if ( jsoneq( data, &tokens[i], "showHullEdges" ) == 0 )
 		{
@@ -263,27 +269,11 @@ void SampleContext::Load()
 		}
 		else if ( jsoneq( data, &tokens[i], "replayKeyframeBudgetMB" ) == 0 )
 		{
-			int count = tokens[i + 1].end - tokens[i + 1].start;
-			if ( count > (int)sizeof( buffer ) - 1 )
-			{
-				count = (int)sizeof( buffer ) - 1;
-			}
-			const char* s = data + tokens[i + 1].start;
-			memcpy( buffer, s, count );
-			buffer[count] = 0;
-			replayKeyframeBudgetMB = b3ClampInt( (int)strtol( buffer, nullptr, 10 ), 64, 4096 );
+			replayKeyframeBudgetMB = b3ClampInt( ParseInt( data, tokens[i + 1] ), 64, 4096 );
 		}
 		else if ( jsoneq( data, &tokens[i], "replayKeyframeMinInterval" ) == 0 )
 		{
-			int count = tokens[i + 1].end - tokens[i + 1].start;
-			if ( count > (int)sizeof( buffer ) - 1 )
-			{
-				count = (int)sizeof( buffer ) - 1;
-			}
-			const char* s = data + tokens[i + 1].start;
-			memcpy( buffer, s, count );
-			buffer[count] = 0;
-			replayKeyframeMinInterval = b3ClampInt( (int)strtol( buffer, nullptr, 10 ), 1, 1024 );
+			replayKeyframeMinInterval = b3ClampInt( ParseInt( data, tokens[i + 1] ), 1, 1024 );
 		}
 	}
 
@@ -329,6 +319,9 @@ Sample::Sample( SampleContext* context )
 	m_mouseDelta = { 0.0f, 0.0f };
 	m_launchSpeedScale = 5.0f;
 
+	m_shadowSplitNear = 0.0f;
+	m_shadowSplitFar = 0.0f;
+
 	g_randomSeed = RAND_SEED;
 
 	b3Capacity capacity = {};
@@ -367,7 +360,13 @@ void Sample::FinishRecording()
 	}
 
 	b3World_StopRecording( m_worldId );
-	b3SaveRecordingToFile( m_recording, m_context->recordingFile );
+
+	// The buffer is freed either way, so a failed write has to be said out loud
+	if ( b3SaveRecordingToFile( m_recording, m_context->recordingFile ) == false )
+	{
+		fprintf( stderr, "Failed to write recording '%s'\n", m_context->recordingFile );
+	}
+
 	b3DestroyRecording( m_recording );
 	m_recording = nullptr;
 }
@@ -499,10 +498,23 @@ void Sample::Step()
 	// Box3D uses this to decide which shapes enter the draw set and lazily fire
 	// createDebugShape. The camera derives it from the view distance, in length units
 	// around the simulation eye, matching the broad-phase tree and the far plane.
-	debugDraw.drawingBounds = m_camera->DrawBounds();
+	const b3AABB drawBox = m_camera->DrawBounds();
 
-	// Same view box drives compound child culling in the adapter.
-	SetViewBounds( debugDraw.drawingBounds );
+	// A caster between the view and the sun is off screen but still darkens what
+	// is on screen, so the draw set has to reach past the view box. Bounds come
+	// back in the eye-relative frame the view inverse maps into, hence the offset.
+	b3Vec3 casterLo, casterHi;
+	const Mat4 viewInv = m_camera->ViewInverse();
+	const Mat4 projInv = m_camera->ProjInverse();
+	GetShadowCasterBounds( &viewInv, &projInv, &casterLo, &casterHi );
+	const b3AABB casterBox = b3OffsetAABB( { casterLo, casterHi }, m_camera->DrawOrigin() );
+
+	debugDraw.drawingBounds.lowerBound = b3Min( drawBox.lowerBound, casterBox.lowerBound );
+	debugDraw.drawingBounds.upperBound = b3Max( drawBox.upperBound, casterBox.upperBound );
+
+	// Compound child culling keeps the tighter view box. Widening it there would
+	// cull nothing.
+	SetViewBounds( drawBox );
 
 	ApplyGuiFlags( &debugDraw );
 
@@ -970,7 +982,7 @@ void Sample::DrawMetrics()
 				int count = s.colorCounts[i];
 				bool isOverflow = ( i == overflowIndex );
 
-				// Skip empty slots, but always show overflow — a non-zero overflow row is the signal we care about.
+				// Skip empty slots, but always show overflow.
 				if ( count == 0 && !isOverflow )
 				{
 					continue;
@@ -1344,10 +1356,25 @@ void SelectSample( SampleContext* context, int selection, bool restart )
 	context->restart = restart;
 	context->sample = g_sampleEntries[selection].CreateFcn( context );
 
-	// Fit the shadow cascade range to the world bounds.
-	b3AABB bounds = b3World_GetBounds( context->sample->m_worldId );
-	float diagonal = b3Distance( bounds.lowerBound, bounds.upperBound );
-	SetShadowSplitFar( b3ClampFloat( diagonal, SHADOW_SPLIT_FAR, 200.0f ) );
+	// A sample that knows where its content sits relative to its camera says
+	// so, and is taken at its word. The ceiling below guards a guess, not a
+	// measurement, so capping an explicit request would only hide it.
+	if ( context->sample->m_shadowSplitFar > 0.0f )
+	{
+		// A sample wanting only more reach leaves the near end at zero.
+		float splitNear = context->sample->m_shadowSplitNear;
+		SetShadowSplits( splitNear > 0.0f ? splitNear : SHADOW_SPLIT_NEAR, context->sample->m_shadowSplitFar );
+	}
+	else
+	{
+		// Otherwise fit the range to the world bounds. The bounds are a poor
+		// proxy for how far shadows need to reach: a ground plate stretches
+		// the diagonal well past anything worth shadowing, so the ceiling
+		// matters more than the estimate.
+		b3AABB bounds = b3World_GetBounds( context->sample->m_worldId );
+		float diagonal = b3Distance( bounds.lowerBound, bounds.upperBound );
+		SetShadowSplits( SHADOW_SPLIT_NEAR, b3ClampFloat( diagonal, SHADOW_SPLIT_FAR, SHADOW_SPLIT_FAR_MAX ) );
+	}
 
 	// Samples read restart only while constructing, to keep the camera across a
 	// restart. Clear it so a later switch starts fresh.
@@ -1361,13 +1388,20 @@ void OpenReplayFileDialog( SampleContext* context )
 		return;
 	}
 
-	NFD_Init();
+	if ( NFD_Init() != NFD_OKAY )
+	{
+		return;
+	}
+
 	nfdu8char_t* outPath = nullptr;
 	nfdu8filteritem_t filter[1] = { { "Box3D recording", "b3rec" } };
 
-	// Start in the working directory, where recordings are saved by default.
-	std::u8string cwd = std::filesystem::current_path().u8string();
-	const nfdu8char_t* defaultPath = reinterpret_cast<const nfdu8char_t*>( cwd.c_str() );
+	// Start in the working directory, where recordings are saved by default. A
+	// deleted or unreadable working directory just means no starting point.
+	std::error_code ec;
+	std::u8string cwd = std::filesystem::current_path( ec ).u8string();
+	const nfdu8char_t* defaultPath = ec ? nullptr : reinterpret_cast<const nfdu8char_t*>( cwd.c_str() );
+
 	if ( NFD_OpenDialogU8( &outPath, filter, 1, defaultPath ) == NFD_OKAY )
 	{
 		snprintf( context->replayFile, sizeof( context->replayFile ), "%s", outPath );
@@ -1504,6 +1538,61 @@ static void DrawRenderMenu( SampleContext& ctx )
 {
 	ImGui::MenuItem( "Shadows", nullptr, &ctx.enableShadows );
 
+	if ( ImGui::BeginMenu( "Cascades" ) )
+	{
+		ImGui::PushItemWidth( 8.0f * ImGui::GetFontSize() );
+
+		// Where the split distribution starts, not where shadows start. Raising
+		// it hands the whole working volume to the first cascade and coarsens
+		// it to suit. The c0 row below is what to steer by: it says how far the
+		// sharp cascade reaches and what one of its texels costs.
+		float splitNear = GetShadowSplitNear();
+		if ( ImGui::SliderFloat( "Start", &splitNear, 0.1f, 30.0f, "%.1f m" ) )
+		{
+			SetShadowSplits( splitNear, GetShadowSplitFar() );
+		}
+
+		// Selecting a sample refits the range to the world, so a value dialed
+		// in here survives only until the next sample switch.
+		float splitFar = GetShadowSplitFar();
+		if ( ImGui::SliderFloat( "Range", &splitFar, 10.0f, 200.0f, "%.0f m" ) )
+		{
+			SetShadowSplitFar( splitFar );
+		}
+
+		float lambda = GetShadowSplitLambda();
+		if ( ImGui::SliderFloat( "Distribution", &lambda, 0.0f, 1.0f, "%.2f" ) )
+		{
+			SetShadowSplitLambda( lambda );
+		}
+
+		ImGui::PopItemWidth();
+
+		// Where each cascade ends and how much world one of its texels covers.
+		// A quality cliff at a boundary is the step between two neighboring
+		// texel sizes, which is easier to read here than off the image.
+		if ( ImGui::BeginTable( "cascades", 3, ImGuiTableFlags_SizingFixedFit ) )
+		{
+			ImGui::TableSetupColumn( "csm" );
+			ImGui::TableSetupColumn( "far" );
+			ImGui::TableSetupColumn( "texel" );
+			ImGui::TableHeadersRow();
+			for ( int i = 0; i < SHADOW_CASCADE_COUNT; ++i )
+			{
+				ImGui::TableNextRow();
+				ImGui::TableSetColumnIndex( 0 );
+				ImGui::Text( "%d", i );
+				ImGui::TableSetColumnIndex( 1 );
+				ImGui::Text( "%.1f m", GetCascadeFarViewZ( i ) );
+				ImGui::TableSetColumnIndex( 2 );
+				ImGui::Text( "%.0f mm", 1000.0f * GetCascadeTexelWorld( i ) );
+			}
+			ImGui::EndTable();
+		}
+
+		ImGui::EndMenu();
+	}
+
 	if ( ImGui::BeginMenu( "GTAO" ) )
 	{
 		ImGui::MenuItem( "Enable", nullptr, &ctx.enableGtao );
@@ -1580,7 +1669,7 @@ static void DrawMenuBar( SampleContext* context )
 		if ( ImGui::BeginMenu( "Sim" ) )
 		{
 			ImGui::MenuItem( "Pause", "P", &context->pause );
-			if ( ImGui::MenuItem( "Single Step", "O" ) )
+			if ( ImGui::MenuItem( "Single Step", "." ) )
 			{
 				context->singleStep += 1;
 			}
@@ -1628,11 +1717,17 @@ static void DrawMenuBar( SampleContext* context )
 				cam.Frame( aabb, aspect, 0.75f );
 			}
 			ImGui::MenuItem( "Shapes", nullptr, &gd->drawShapes );
-			ImGui::MenuItem( "Transparent", nullptr, &context->transparentDynamic );
+			if ( ImGui::BeginMenu( "Transparency" ) )
+			{
+				ImGui::MenuItem( "Dynamic", nullptr, &context->transparentDynamic );
+				ImGui::MenuItem( "Kinematic", nullptr, &context->transparentKinematic );
+				ImGui::EndMenu();
+			}
 			ImGui::MenuItem( "Joints", nullptr, &gd->drawJoints );
 			ImGui::MenuItem( "Joint Extras", nullptr, &gd->drawJointExtras );
 			ImGui::MenuItem( "Bounds", nullptr, &gd->drawBounds );
 			ImGui::MenuItem( "Mass", nullptr, &gd->drawMass );
+			ImGui::MenuItem( "Sleep", nullptr, &gd->drawSleep );
 			ImGui::MenuItem( "Body Names", nullptr, &gd->drawBodyNames );
 			ImGui::MenuItem( "Graph Colors", nullptr, &gd->drawGraphColors );
 			ImGui::MenuItem( "Islands", nullptr, &gd->drawIslands );
@@ -1641,16 +1736,15 @@ static void DrawMenuBar( SampleContext* context )
 			ImGui::MenuItem( "Contact Normals", nullptr, &gd->drawContactNormals );
 			ImGui::MenuItem( "Contact Features", nullptr, &gd->drawContactFeatures );
 			ImGui::MenuItem( "Contact Forces", nullptr, &gd->drawContactForces );
-			ImGui::MenuItem( "Friction Forces", nullptr, &gd->drawFrictionForces );
 			if ( ImGui::BeginMenu( "Anchor" ) )
 			{
-				if ( ImGui::MenuItem( "Anchor A", nullptr, gd->drawAnchorA != 0 ) )
+				if ( ImGui::MenuItem( "Anchor A", nullptr, gd->drawAnchorA == true ) )
 				{
-					gd->drawAnchorA = 1;
+					gd->drawAnchorA = true;
 				}
-				if ( ImGui::MenuItem( "Anchor B", nullptr, gd->drawAnchorA == 0 ) )
+				if ( ImGui::MenuItem( "Anchor B", nullptr, gd->drawAnchorA == false ) )
 				{
-					gd->drawAnchorA = 0;
+					gd->drawAnchorA = false;
 				}
 				ImGui::EndMenu();
 			}
@@ -1747,7 +1841,8 @@ static void DrawMenuBar( SampleContext* context )
 					DrawRow( "Tab", "Show / hide UI" );
 					DrawRow( "M", "Show / hide diagnostics" );
 					DrawRow( "P", "Pause / resume" );
-					DrawRow( "O", "Single step (Shift: 5)" );
+					DrawRow( ".", "Single step (Shift: 5)" );
+					DrawRow( ",", "Step back, replay only (Shift: 5)" );
 					DrawRow( "R", "Restart sample" );
 					DrawRow( "[  ]", "Previous / next sample" );
 					DrawRow( "Ctrl+O", "Open sample picker" );
@@ -1766,7 +1861,7 @@ static void DrawMenuBar( SampleContext* context )
 					DrawRow( "Alt + left drag", "Orbit camera" );
 					DrawRow( "Alt + middle drag", "Pan camera" );
 					DrawRow( "Alt + right drag", "Zoom (dolly)" );
-					DrawRow( "Right drag", "Fly look (WASD to move)" );
+					DrawRow( "Right drag", "Fly look (WASD, Q / E to move)" );
 					DrawRow( "Scroll", "Zoom" );
 					DrawRow( "Shift + left", "Shoot (Ctrl spin, Alt ragdoll)" );
 					ImGui::EndTable();
@@ -2079,331 +2174,4 @@ float CastClosestCallback( b3ShapeId shapeId, b3Pos point, b3Vec3 normal, float 
 	rayContext->triangleIndex = triangleIndex;
 	rayContext->hit = true;
 	return fraction;
-}
-
-static bool MoverFilterCallback( b3ShapeId shapeId, void* context )
-{
-	CharacterMover* self = (CharacterMover*)context;
-	for ( int i = 0; i < self->m_ignoreCount; ++i )
-	{
-		if ( B3_ID_EQUALS( shapeId, self->m_ignoreShapeIds[i] ) )
-		{
-			return false;
-		}
-	}
-
-	return true;
-}
-
-void CharacterMover::Initialize( Sample* sample, b3Pos position )
-{
-	m_sample = sample;
-	m_transform.p = position;
-	m_transform.q = b3Quat_identity;
-	m_velocity = { 0.0f, 0.0f, 0.0f };
-	m_capsule = { { 0.0f, -0.5f, 0.0f }, { 0.0f, 0.5f, 0.0f }, 0.3f };
-
-	m_planeCount = 0;
-	m_totalIterations = 0;
-	m_pogoVelocity = 0.0f;
-	m_onGround = false;
-	m_sprint = false;
-
-	m_ignoreShapeIds = nullptr;
-	m_ignoreCount = 0;
-}
-
-static bool PlaneResultFcn( b3ShapeId shapeId, const b3PlaneResult* planeResults, int planeCount, void* context )
-{
-	if ( MoverFilterCallback( shapeId, context ) == false )
-	{
-		// ignore these planes but continue looking for more
-		return true;
-	}
-
-	CharacterMover* self = static_cast<CharacterMover*>( context );
-	float maxPush = FLT_MAX;
-	bool clipVelocity = true;
-	MoverShapeUserData* userData = static_cast<MoverShapeUserData*>( (void*)b3Shape_GetUserData( shapeId ) );
-	if ( userData != nullptr )
-	{
-		maxPush = userData->maxPush;
-		clipVelocity = userData->clipVelocity;
-	}
-
-	for ( int i = 0; i < planeCount && self->m_planeCount < CharacterMover::m_planeCapacity; ++i )
-	{
-		assert( b3IsValidPlane( planeResults[i].plane ) );
-		self->m_planes[self->m_planeCount] = {
-			.plane = planeResults[i].plane,
-			.pushLimit = maxPush,
-			.push = 0.0f,
-			.clipVelocity = clipVelocity,
-		};
-		self->m_planeExtras[self->m_planeCount] = {
-			.point = b3OffsetPos( self->m_transform.p, planeResults[i].point ),
-			.shapeId = shapeId,
-		};
-		self->m_planeCount += 1;
-	}
-
-	return true;
-}
-
-void CharacterMover::SolveMove( float timeStep, b3Vec3 forward, b3Vec3 right, b3Vec2 throttle, bool clipVelocity )
-{
-	// Friction
-	float speed = b3Length( m_velocity );
-	if ( speed < m_minSpeed )
-	{
-		m_velocity.x = 0.0f;
-		m_velocity.y = 0.0f;
-	}
-	else
-	{
-		// Linear damping above stopSpeed and fixed reduction below stopSpeed
-		float control = speed < m_stopSpeed ? m_stopSpeed : speed;
-
-		// friction has units of 1/time
-		float drop = control * m_friction * timeStep;
-		float newSpeed = b3MaxFloat( 0.0f, speed - drop );
-		m_velocity *= newSpeed / speed;
-	}
-
-	float maxSpeed = m_sprint ? 1.5f * m_maxSpeed : m_maxSpeed;
-
-	b3Vec3 desiredVelocity = maxSpeed * throttle.x * forward + maxSpeed * throttle.y * right;
-	float desiredSpeed;
-	b3Vec3 desiredDirection = b3GetLengthAndNormalize( &desiredSpeed, desiredVelocity );
-
-	if ( desiredSpeed > maxSpeed )
-	{
-		desiredVelocity *= maxSpeed / desiredSpeed;
-		desiredSpeed = maxSpeed;
-	}
-
-	if ( m_onGround )
-	{
-		m_velocity.y = 0.0f;
-	}
-
-	// Accelerate
-	float currentSpeed = b3Dot( m_velocity, desiredDirection );
-	float addSpeed = desiredSpeed - currentSpeed;
-	if ( addSpeed > 0.0f )
-	{
-		float accelSpeed = m_accelerate * maxSpeed * timeStep;
-		if ( accelSpeed > addSpeed )
-		{
-			accelSpeed = addSpeed;
-		}
-
-		m_velocity += accelSpeed * desiredDirection;
-	}
-
-	m_velocity.y -= m_gravity * timeStep;
-
-	b3WorldId worldId = m_sample->m_worldId;
-
-	float pogoRestLength = 3.0f * m_capsule.radius;
-	float rayLength = pogoRestLength + m_capsule.radius;
-	b3Pos rayOrigin = b3TransformWorldPoint( m_transform, m_capsule.center1 );
-	b3Vec3 rayTranslation = -rayLength * b3Vec3_axisY;
-	b3QueryFilter skipTeamFilter = { 1, ~2u };
-	skipTeamFilter.name = "pogo";
-	b3RayResult rayResult = b3World_CastRayClosest( worldId, rayOrigin, rayTranslation, skipTeamFilter );
-
-	if ( rayResult.hit == false )
-	{
-		m_onGround = false;
-		m_pogoVelocity = 0.0f;
-
-		DrawLine( rayOrigin, b3OffsetPos( rayOrigin, rayTranslation ), MakeColor( b3_colorGray ) );
-	}
-	else
-	{
-		m_onGround = true;
-		float pogoCurrentLength = rayResult.fraction * rayLength;
-
-		float zeta = 0.7f;
-		float hertz = 4.0f;
-		float omega = 2.0f * B3_PI * hertz;
-		float omegaH = omega * timeStep;
-
-		m_pogoVelocity = ( m_pogoVelocity - omega * omegaH * ( pogoCurrentLength - pogoRestLength ) ) /
-						 ( 1.0f + 2.0f * zeta * omegaH + omegaH * omegaH );
-		DrawLine( rayOrigin, rayResult.point, MakeColor( b3_colorGreen ) );
-	}
-
-	b3Pos startPosition = m_transform.p;
-	b3Pos target = m_transform.p + timeStep * m_velocity + timeStep * m_pogoVelocity * b3Vec3_axisY;
-
-	// Want the mover to collide with allies
-	b3QueryFilter moverFilter = { .categoryBits = 1, .maskBits = ~0u, .id = 1, .name = "mover_collide" };
-
-	// The cast should ignore allies
-	b3QueryFilter castFilter = { .categoryBits = 1, .maskBits = ~2u, .id = 1, .name = "mover_cast" };
-
-	m_totalIterations = 0;
-	float tolerance = 0.01f;
-
-	for ( int iteration = 0; iteration < 5; ++iteration )
-	{
-		m_planeCount = 0;
-
-		b3Capsule mover;
-		mover.center1 = m_capsule.center1;
-		mover.center2 = m_capsule.center2;
-		mover.radius = m_capsule.radius;
-
-		b3World_CollideMover( worldId, m_transform.p, &mover, moverFilter, PlaneResultFcn, this );
-
-		b3Vec3 targetDelta = target - m_transform.p;
-		b3PlaneSolverResult result = b3SolvePlanes( targetDelta, m_planes, m_planeCount );
-
-		m_totalIterations += result.iterationCount;
-
-		b3Vec3 delta = result.delta;
-
-		float fraction = b3World_CastMover( worldId, m_transform.p, &mover, delta, castFilter, MoverFilterCallback, this );
-
-		delta *= fraction;
-		m_transform.p = m_transform.p + delta;
-
-		if ( b3LengthSquared( delta ) < tolerance * tolerance )
-		{
-			break;
-		}
-	}
-
-	for ( int i = 0; i < m_planeCount; ++i )
-	{
-		b3BodyId bodyId = b3Shape_GetBody( m_planeExtras[i].shapeId );
-		b3BodyType bodyType = b3Body_GetType( bodyId );
-		if ( bodyType != b3_dynamicBody )
-		{
-			continue;
-		}
-
-		b3Pos point = m_planeExtras[i].point;
-		b3Vec3 normal = b3Neg( m_planes[i].plane.normal );
-
-		float invMassA = 0.0f;
-		float invMassB = b3Body_GetInverseMass( bodyId );
-		b3Matrix3 invIB = b3Body_GetWorldInverseRotationalInertia( bodyId );
-
-		b3Pos pB = b3Body_GetWorldCenter( bodyId );
-		b3Vec3 rB = b3SubPos( point, pB );
-
-		b3Vec3 rnB = b3Cross( rB, normal );
-		float kNormal = invMassA + invMassB + b3Dot( rnB, b3MulMV( invIB, rnB ) );
-		float normalMass = kNormal > 0.0f ? 1.0f / kNormal : 0.0f;
-
-		b3Vec3 vB = b3Body_GetLinearVelocity( bodyId );
-		b3Vec3 omegaB = b3Body_GetAngularVelocity( bodyId );
-		b3Vec3 vrB = b3Add( vB, b3Cross( omegaB, rB ) );
-		float vn = b3Dot( b3Sub( vrB, m_velocity ), normal );
-		float impulse = b3MaxFloat( -normalMass * vn, 0.0f );
-
-		b3Vec3 P = b3MulSV( impulse, normal );
-		m_velocity = b3MulSub( m_velocity, invMassA, P );
-
-		b3Body_ApplyLinearImpulse( bodyId, P, point, true );
-	}
-
-	if ( clipVelocity )
-	{
-		// Using the velocity clipper can avoid picking up velocity from depenetration.
-		// This allows the mover to avoid velocity from soft collision depenetration.
-		m_velocity = b3ClipVector( m_velocity, m_planes, m_planeCount );
-	}
-	else if ( timeStep > 0.0f )
-	{
-		// Using the position delta is more holistic and intuitive in some cases.
-		m_velocity = ( 1.0f / timeStep ) * ( m_transform.p - startPosition );
-	}
-}
-
-void CharacterMover::Step( b3ShapeId* ignoreShapes, int ignoreCount, bool clipVelocity )
-{
-	m_ignoreShapeIds = ignoreShapes;
-	m_ignoreCount = ignoreCount;
-
-	b3Vec2 throttle = { 0.0f, 0.0f };
-	b3Vec3 forward = -m_sample->m_camera->GetForward();
-	b3Vec3 right = m_sample->m_camera->GetRight();
-	forward.y = 0.0f;
-
-	if ( m_sample->m_camera->m_thirdPerson )
-	{
-		if ( IsKeyDown( KEY_W ) )
-		{
-			throttle.x += 1.0f;
-		}
-
-		if ( IsKeyDown( KEY_S ) )
-		{
-			throttle.x -= 1.0f;
-		}
-
-		if ( IsKeyDown( KEY_A ) )
-		{
-			throttle.y -= 1.0f;
-		}
-
-		if ( IsKeyDown( KEY_D ) )
-		{
-			throttle.y += 1.0f;
-		}
-
-		if ( IsKeyDown( KEY_SPACE ) && m_onGround == true )
-		{
-			m_velocity.y = m_jumpSpeed;
-			m_onGround = false;
-		}
-
-		if ( m_onGround == true )
-		{
-			m_sprint = IsKeyDown( KEY_LEFT_SHIFT );
-		}
-		else
-		{
-			m_sprint = false;
-		}
-	}
-
-	float hertz = m_sample->m_context->hertz;
-	float timeStep = hertz > 0.0f ? 1.0f / hertz : 0.0f;
-
-	// throttle = { 0.0f, 0.0f, -1.0f };
-
-	SolveMove( timeStep, forward, right, throttle, clipVelocity );
-
-	b3Pos position = m_transform.p;
-
-	// Follow the mover and latch the draw origin before drawing, so the overlays below demote
-	// against the same eye the view renders from.
-	if ( m_sample->m_camera->m_thirdPerson )
-	{
-		m_sample->m_camera->m_pivot = position;
-		m_sample->m_camera->UpdateTransform();
-	}
-
-	SetDrawOrigin( m_sample->m_camera->DrawOrigin() );
-
-	int count = m_planeCount;
-	for ( int i = 0; i < count; ++i )
-	{
-		b3Plane plane = m_planes[i].plane;
-		b3Pos p1 = position + ( plane.offset - m_capsule.radius ) * plane.normal;
-		b3Pos p2 = p1 + 0.1f * plane.normal;
-		DrawPoint( p1, 5.0f, MakeColor( b3_colorYellow ) );
-		DrawLine( p1, p2, MakeColor( b3_colorYellow ) );
-	}
-
-	DrawSolidCapsule( m_transform, m_capsule, MakeColor( b3_colorBlue ) );
-	DrawLine( position, position + m_velocity, MakeColor( b3_colorPurple ) );
-
-	m_ignoreShapeIds = nullptr;
-	m_ignoreCount = 0;
 }

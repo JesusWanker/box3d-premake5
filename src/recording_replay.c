@@ -8,12 +8,12 @@
 #include "recording_replay.h"
 
 #include "body.h"
-#include "compound.h"
 #include "physics_world.h"
 #include "world_snapshot.h"
 
 #include "box3d/box3d.h"
 
+#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -375,8 +375,8 @@ b3MotionLocks b3RecR_LOCKS( b3RecReader* rdr )
 // Rotating set of static string buffers, valid until the next 4 STR reads.
 const char* b3RecR_STR( b3RecReader* rdr )
 {
-	char* buf = rdr->strBufs[rdr->strNext];
-	rdr->strNext = ( rdr->strNext + 1 ) & 3;
+	char* buf = rdr->stringBuffers[rdr->nextString];
+	rdr->nextString = ( rdr->nextString + 1 ) & 3;
 
 	uint16_t len = b3RecR_U16( rdr );
 	if ( len == 0xFFFFu )
@@ -385,9 +385,9 @@ const char* b3RecR_STR( b3RecReader* rdr )
 	}
 
 	int n = (int)len;
-	if ( n > B3_BODY_NAME_LENGTH )
+	if ( n > B3_MAX_NAME_LENGTH )
 	{
-		n = B3_BODY_NAME_LENGTH;
+		n = B3_MAX_NAME_LENGTH;
 	}
 	b3RecRdrCheck( rdr, (int)len );
 	if ( rdr->ok && n > 0 )
@@ -441,6 +441,8 @@ b3BodyDef b3RecR_BODYDEF( b3RecReader* rdr )
 b3ShapeDef b3RecR_SHAPEDEF( b3RecReader* rdr )
 {
 	b3ShapeDef def = b3DefaultShapeDef();
+
+	def.name = b3RecR_STR( rdr );
 	(void)b3RecR_U64( rdr ); // userData placeholder
 
 	int matCount = b3RecR_I32( rdr );
@@ -480,6 +482,7 @@ b3ShapeDef b3RecR_SHAPEDEF( b3RecReader* rdr )
 	def.enablePreSolveEvents = b3RecR_BOOL( rdr );
 	def.invokeContactCreation = b3RecR_BOOL( rdr );
 	def.updateBodyMass = b3RecR_BOOL( rdr );
+	def.enableSpeculativeContact = b3RecR_BOOL( rdr );
 	def.userData = NULL;
 	return def;
 }
@@ -953,6 +956,11 @@ static void b3RecDispatch_BodySetBullet( const b3RecArgs_BodySetBullet* a, b3Rec
 	b3Body_SetBullet( b3RecMakeBodyId( rdr, a->body ), a->flag );
 }
 
+static void b3RecDispatch_BodyAllowFastRotation( const b3RecArgs_BodyAllowFastRotation* a, b3RecReader* rdr )
+{
+	b3Body_AllowFastRotation( b3RecMakeBodyId( rdr, a->body ), a->flag );
+}
+
 static void b3RecDispatch_BodyEnableContactRecycling( const b3RecArgs_BodyEnableContactRecycling* a, b3RecReader* rdr )
 {
 	b3Body_EnableContactRecycling( b3RecMakeBodyId( rdr, a->body ), a->flag );
@@ -1015,7 +1023,7 @@ static void b3RecDispatch_CreateMeshShape( const b3RecArgs_CreateMeshShape* a, b
 		return;
 	}
 	b3RegistrySlot* slot = rdr->slots + id;
-	const b3MeshData* mesh = (const b3MeshData*)b3RecGetLiveMesh( slot );
+	const b3MeshData* mesh = b3RecGetLiveMesh( slot );
 	b3BodyId bodyId = b3RecMakeBodyId( rdr, a->body );
 	b3ShapeId gotId = b3CreateMeshShape( bodyId, &a->def, mesh, a->scale );
 	b3RecCheckShapeId( rdr, gotId, recId );
@@ -1067,13 +1075,18 @@ static void b3RecDispatch_CreateCompoundShape( const b3RecArgs_CreateCompoundSha
 	b3BodyId bodyId = b3RecMakeBodyId( rdr, a->body );
 	// b3CreateCompoundShape takes a non-const def pointer; cast away const for the scratch def
 	b3ShapeDef shapeDef = a->def;
-	b3ShapeId gotId = b3CreateCompoundShape( bodyId, &shapeDef, compound );
+	b3ShapeId gotId = b3CreateBakedCompoundShape( bodyId, &shapeDef, compound );
 	b3RecCheckShapeId( rdr, gotId, recId );
 }
 
 static void b3RecDispatch_DestroyShape( const b3RecArgs_DestroyShape* a, b3RecReader* rdr )
 {
 	b3DestroyShape( b3RecMakeShapeId( rdr, a->shape ), a->updateBodyMass );
+}
+
+static void b3RecDispatch_ShapeSetName( const b3RecArgs_ShapeSetName* a, b3RecReader* rdr )
+{
+	b3Shape_SetName( b3RecMakeShapeId( rdr, a->shape ), a->name );
 }
 
 static void b3RecDispatch_ShapeSetDensity( const b3RecArgs_ShapeSetDensity* a, b3RecReader* rdr )
@@ -1094,6 +1107,11 @@ static void b3RecDispatch_ShapeSetRestitution( const b3RecArgs_ShapeSetRestituti
 static void b3RecDispatch_ShapeSetSurfaceMaterial( const b3RecArgs_ShapeSetSurfaceMaterial* a, b3RecReader* rdr )
 {
 	b3Shape_SetSurfaceMaterial( b3RecMakeShapeId( rdr, a->shape ), a->material );
+}
+
+static void b3RecDispatch_ShapeSetMeshMaterial( const b3RecArgs_ShapeSetMeshMaterial* a, b3RecReader* rdr )
+{
+	b3Shape_SetMeshMaterial( b3RecMakeShapeId( rdr, a->shape ), a->material, a->index );
 }
 
 static void b3RecDispatch_ShapeSetFilter( const b3RecArgs_ShapeSetFilter* a, b3RecReader* rdr )
@@ -1129,6 +1147,35 @@ static void b3RecDispatch_ShapeSetSphere( const b3RecArgs_ShapeSetSphere* a, b3R
 static void b3RecDispatch_ShapeSetCapsule( const b3RecArgs_ShapeSetCapsule* a, b3RecReader* rdr )
 {
 	b3Shape_SetCapsule( b3RecMakeShapeId( rdr, a->shape ), &a->capsule );
+}
+
+static void b3RecDispatch_ShapeSetHull( const b3RecArgs_ShapeSetHull* a, b3RecReader* rdr )
+{
+	uint32_t id = a->geometryId;
+	if ( id >= (uint32_t)rdr->slotCount )
+	{
+		printf( "b3ReplayFile: hull geometryId %u out of range\n", id );
+		rdr->ok = false;
+		return;
+	}
+	b3RegistrySlot* slot = rdr->slots + id;
+	b3ShapeId shapeId = b3RecMakeShapeId( rdr, a->shape );
+	b3Shape_SetHull( shapeId, (const b3HullData*)slot->bytes );
+}
+
+static void b3RecDispatch_ShapeSetMesh( const b3RecArgs_ShapeSetMesh* a, b3RecReader* rdr )
+{
+	uint32_t id = a->geometryId;
+	if ( id >= (uint32_t)rdr->slotCount )
+	{
+		printf( "b3ReplayFile: mesh geometryId %u out of range\n", id );
+		rdr->ok = false;
+		return;
+	}
+	b3RegistrySlot* slot = rdr->slots + id;
+	b3ShapeId shapeId = b3RecMakeShapeId( rdr, a->shape );
+	const b3MeshData* mesh = b3RecGetLiveMesh( slot );
+	b3Shape_SetMesh( shapeId, mesh, a->scale );
 }
 
 static void b3RecDispatch_ShapeApplyWind( const b3RecArgs_ShapeApplyWind* a, b3RecReader* rdr )
@@ -1631,8 +1678,7 @@ static void b3RecDispatch_StateHash( const b3RecArgs_StateHash* a, b3RecReader* 
 	uint64_t computed = b3HashWorldState( world );
 	if ( computed != a->hash )
 	{
-		printf( "b3ReplayFile: StateHash mismatch (recorded=0x%llX, computed=0x%llX)\n", (unsigned long long)a->hash,
-				(unsigned long long)computed );
+		printf( "b3ReplayFile: StateHash mismatch (recorded=0x%" PRIx64 ", computed=0x%" PRIx64 ")\n", a->hash, computed );
 		rdr->diverged = true;
 	}
 }
@@ -2129,7 +2175,7 @@ static int b3RecDispatchOne( b3RecReader* rdr )
 
 bool b3ValidateReplay( const void* data, int size, int workerCount )
 {
-	b3RecPlayer* player = b3RecPlayer_Create( data, size, workerCount );
+	b3RecPlayer* player = b3CreatePlayer( data, size, workerCount );
 	if ( player == NULL )
 	{
 		return false;
@@ -2144,7 +2190,7 @@ bool b3ValidateReplay( const void* data, int size, int workerCount )
 	}
 
 	bool ok = player->rdr.ok && player->rdr.diverged == false;
-	b3RecPlayer_Destroy( player );
+	b3DestroyPlayer( player );
 	return ok;
 }
 
@@ -2333,14 +2379,14 @@ static void b3RecLoadTags( b3RecReader* rdr, const uint8_t* rp, const uint8_t* d
 		{
 			break;
 		}
-		int n = len > B3_BODY_NAME_LENGTH ? B3_BODY_NAME_LENGTH : (int)len;
+		int n = len > B3_MAX_QUERY_NAME_LENGTH ? B3_MAX_QUERY_NAME_LENGTH : (int)len;
 		tags[loaded].key = key;
 		tags[loaded].id = id;
 		if ( n > 0 )
 		{
-			memcpy( tags[loaded].name, sub.data + sub.cursor, (size_t)n );
+			memcpy( tags[loaded].queryName, sub.data + sub.cursor, (size_t)n );
 		}
-		tags[loaded].name[n] = '\0';
+		tags[loaded].queryName[n] = '\0';
 		sub.cursor += len;
 		b3RecTagLookup_insert( map, key, loaded );
 		loaded += 1;
@@ -2553,7 +2599,7 @@ static void b3RecSeedKeyframeRegistry( b3RecPlayer* player )
 		{
 			memcpy( copy, slot->bytes, (size_t)slot->byteCount );
 		}
-		uint64_t h = b3Hash64Blob( slot->bytes, slot->byteCount );
+		uint64_t h = b3Hash64NonZero( slot->bytes, slot->byteCount );
 		uint32_t id = b3AppendGeometry( reg, slot->kind, h, copy, slot->byteCount );
 		// Seeding in order without dedup keeps id == slot index.
 		B3_ASSERT( id == (uint32_t)i );
@@ -2568,12 +2614,12 @@ static void b3RecCaptureKeyframe( b3RecPlayer* player )
 	b3World* world = b3GetWorldFromId( player->rdr.replayWorldId );
 	b3RecBuffer buf = { 0 };
 
-	int regCountBefore = player->keyframeRec->registry.count;
+	int regCountBefore = player->keyframeRec->registry.entries.count;
 	B3_UNUSED( regCountBefore );
 
 	b3SerializeWorld( world, &buf, player->keyframeRec );
 	// Registry must not grow: all geometry was pre-seeded and the registry dedups exactly.
-	B3_ASSERT( player->keyframeRec->registry.count == regCountBefore );
+	B3_ASSERT( player->keyframeRec->registry.entries.count == regCountBefore );
 
 	size_t bodyBytes = (size_t)player->bodyIdCount * sizeof( b3BodyId );
 	size_t newBytes = (size_t)buf.capacity + bodyBytes;
@@ -2677,7 +2723,7 @@ static b3WorldId b3RecPlayerCreateWorld( const b3RecPlayer* player )
 	return b3CreateWorld( &worldDef );
 }
 
-b3RecPlayer* b3RecPlayer_Create( const void* data, int size, int workerCount )
+b3RecPlayer* b3CreatePlayer( const void* data, int size, int workerCount )
 {
 	if ( data == NULL || size < (int)sizeof( b3RecHeader ) )
 	{
@@ -2734,10 +2780,10 @@ b3RecPlayer* b3RecPlayer_Create( const void* data, int size, int workerCount )
 	int registryEnd = (int)registryEnd64;
 
 	// Own a private copy so the caller can free their buffer right away.
-	uint8_t* copy = (uint8_t*)b3Alloc( (size_t)size );
+	uint8_t* copy = b3Alloc( (size_t)size );
 	memcpy( copy, data, (size_t)size );
 
-	b3RecPlayer* player = (b3RecPlayer*)b3Alloc( sizeof( b3RecPlayer ) );
+	b3RecPlayer* player = b3Alloc( sizeof( b3RecPlayer ) );
 	memset( player, 0, sizeof( b3RecPlayer ) );
 
 	player->data = copy;
@@ -2831,7 +2877,7 @@ b3RecPlayer* b3RecPlayer_Create( const void* data, int size, int workerCount )
 	return player;
 }
 
-void b3RecPlayer_Destroy( b3RecPlayer* player )
+void b3DestroyPlayer( b3RecPlayer* player )
 {
 	if ( player == NULL )
 	{
@@ -3100,12 +3146,13 @@ void b3RecPlayer_Restart( b3RecPlayer* player )
 
 void b3RecPlayer_SeekFrame( b3RecPlayer* player, int targetFrame )
 {
-	player->atPreStep = false;
-
 	if ( player == NULL )
 	{
 		return;
 	}
+
+	player->atPreStep = false;
+
 	if ( targetFrame < 0 )
 	{
 		targetFrame = 0;
@@ -3485,22 +3532,22 @@ void b3RecPlayer_DrawFrameQueries( b3RecPlayer* player, b3DebugDraw* draw, int q
 				if ( b3RecTagLookup_is_end( it ) == false )
 				{
 					const b3RecTag* tag = &player->rdr.tags[it.data->val];
-					name = tag->name;
+					name = tag->queryName;
 					id = tag->id;
 				}
 			}
 			char label[64];
 			if ( name != NULL && name[0] != '\0' && id != 0 )
 			{
-				snprintf( label, sizeof( label ), "%s (%llu)", name, (unsigned long long)id );
+				snprintf( label, sizeof( label ), "%.40s (%" PRIu64 ")", name, id );
 			}
 			else if ( name != NULL && name[0] != '\0' )
 			{
-				snprintf( label, sizeof( label ), "%s", name );
+				snprintf( label, sizeof( label ), "%.40s", name );
 			}
 			else
 			{
-				snprintf( label, sizeof( label ), "#%llu", (unsigned long long)id );
+				snprintf( label, sizeof( label ), "#%" PRIu64, id );
 			}
 			b3Pos labelPos = q->origin;
 			if ( q->kind == B3_RECQ_OVERLAP_AABB )
@@ -3556,7 +3603,7 @@ b3RecQueryInfo b3RecPlayer_GetFrameQuery( const b3RecPlayer* player, int index )
 			const b3RecTag* tag = &player->rdr.tags[it.data->val];
 			info.id = tag->id;
 			// An id-only tag interns an empty name; report it as none so the viewer shows the id alone.
-			info.name = tag->name[0] != '\0' ? tag->name : NULL;
+			info.name = tag->queryName[0] != '\0' ? tag->queryName : NULL;
 		}
 	}
 	return info;

@@ -11,15 +11,19 @@ set(BOX3D_TEST_FILES
 	test_container.c
     test_determinism.c
     test_distance.c
+    test_hash.c
     test_height_field.c
     test_hull.c
     test_id.c
     test_joint.c
     test_large_world.c
     test_macros.h
+    test_manifold.c
     test_math.c
 	test_mover.c
+    test_name_cache.c
     test_recording.c
+    test_sat.c
     test_shape.c
     test_table.c
     test_world.c
