@@ -210,6 +210,8 @@ void b3CreateContact( b3World* world, b3Shape* shapeA, b3Shape* shapeB, int chil
 	contact->shapeIdA = shapeIdA;
 	contact->shapeIdB = shapeIdB;
 	contact->childIndex = childIndex;
+	contact->encodedBodySimA = b3EncodeBodySimIndex( bodyA );
+	contact->encodedBodySimB = b3EncodeBodySimIndex( bodyB );
 
 	// Both bodies must enable recycling
 	if ( ( bodyA->flags & b3_bodyEnableContactRecycling ) != 0 && ( bodyB->flags & b3_bodyEnableContactRecycling ) != 0 )
@@ -485,7 +487,7 @@ static bool b3ComputeConvexManifold( b3World* world, int workerIndex, b3Contact*
 
 	b3ContactCache* cache = &contact->convexContact.cache;
 
-	int pointCapacity = 32;
+	int pointCapacity = B3_MAX_MANIFOLD_POINTS;
 	b3LocalManifoldPoint* pointBuffer = (b3LocalManifoldPoint*)b3Bump( &arena, pointCapacity * sizeof( b3LocalManifoldPoint ) );
 
 	b3LocalManifold geomManifold = { 0 };
@@ -560,6 +562,7 @@ static bool b3ComputeConvexManifold( b3World* world, int workerIndex, b3Contact*
 	}
 
 	b3Manifold* manifold = contact->manifolds;
+	B3_ASSERT( 0 < geomManifold.pointCount && geomManifold.pointCount <= B3_MAX_MANIFOLD_POINTS );
 	manifold->pointCount = geomManifold.pointCount;
 
 	b3Matrix3 matrixA = b3MakeMatrixFromQuat( xfA.q );

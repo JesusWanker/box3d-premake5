@@ -113,8 +113,16 @@ typedef struct b3AtomicU32
 	uint32_t value;
 } b3AtomicU32;
 
+typedef struct b3AtomicI64
+{
+	// 64-bit atomic wants 8-byte alignment
+	_Alignas( 8 ) int64_t value;
+} b3AtomicI64;
+
 // Minimum memory alignment used for all allocations
 #define B3_ALIGNMENT 16
+
+#define B3_RESTRICT restrict
 
 // Returns the number of elements of an array
 #define B3_ARRAY_COUNT( A ) (int)( sizeof( A ) / sizeof( A[0] ) )
@@ -133,9 +141,13 @@ typedef struct b3AtomicU32
 #define B3_FREE( M, T, N ) b3Free( M, N * sizeof( T ) );
 
 void* b3Alloc( size_t size );
-void* b3AllocZeroed( size_t size );
+void* b3AllocZero( size_t size );
 void b3Free( void* mem, size_t size );
 void* b3GrowAlloc( void* oldMem, int oldSize, int newSize );
+void* b3GrowAllocZeroed( void* oldMem, int oldSize, int newSize );
+
+#define B3_GROW( A, N, M ) b3GrowAlloc( ( A ), (int)( ( N ) * sizeof( *( A ) ) ), (int)( ( M ) * sizeof( *( A ) ) ) )
+#define B3_GROW_ZERO( A, N, M ) b3GrowAllocZeroed( ( A ), (int)( ( N ) * sizeof( *( A ) ) ), (int)( ( M ) * sizeof( *( A ) ) ) )
 
 B3_PRINTF_FORMAT( 1, 2 )
 void b3Log( const char* format, ... );

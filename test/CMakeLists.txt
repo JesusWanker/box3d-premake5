@@ -6,11 +6,13 @@ set(BOX3D_TEST_FILES
     test_bitset.c
 	test_body.c
 	test_body_query.c
+	test_broad_phase.c
 	test_collision.c
 	test_compound.c
 	test_container.c
     test_determinism.c
     test_distance.c
+    test_dynamic_tree.c
     test_hash.c
     test_height_field.c
     test_hull.c
@@ -20,9 +22,11 @@ set(BOX3D_TEST_FILES
     test_macros.h
     test_manifold.c
     test_math.c
+    test_mesh.c
 	test_mover.c
     test_name_cache.c
     test_recording.c
+    test_restitution.c
     test_sat.c
     test_shape.c
     test_table.c

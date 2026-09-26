@@ -8,6 +8,7 @@
 #include "id.h"
 #include "math_functions.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define B3_DEFAULT_CATEGORY_BITS UINT64_MAX
@@ -145,6 +146,13 @@ typedef struct b3WorldDef
 	/// Restitution speed threshold, usually in m/s. Collisions above this
 	/// speed have restitution applied (will bounce).
 	float restitutionThreshold;
+
+	/// Number of iterations of the restitution solver. More iterations can lead to less box spinning.
+	/// @see B3_MAX_RESTITUTION_ITERATIONS
+	int restitutionIterations;
+
+	/// Enable full contact propagation in the restitution solver. Expensive.
+	bool enableRestitutionPropagation;
 
 	/// Hit event speed threshold, usually in m/s. Collisions above this
 	/// speed can generate hit events if the shape also enables hit events.
@@ -301,6 +309,13 @@ typedef struct b3BodyDef
 
 	/// Sleep speed threshold, default is 0.05 meters per second
 	float sleepThreshold;
+
+	/// Continuous collision safety factor. The solver only uses continuous collision if there is a
+	/// risk of tunneling. If the body is moving fast enough to risk tunneling then it is considered a "fast body".
+	/// This improves performance and prevents movement hitches. If a body moving N meter risks tunneling, then the
+	/// body will be considered fast if it moves more than a safetyFactor times N meters over one full time step.
+	/// Non-dimensional. Recommended range [0.01, 0.5]. Default is 0.5 for high performance with low tunneling risk.
+	float safetyFactor;
 
 	/// Optional body name for debugging.
 	const char* name;
@@ -529,69 +544,71 @@ typedef struct b3ShapeDef
 /// @ingroup shape
 B3_API b3ShapeDef b3DefaultShapeDef( void );
 
-//! @cond
 /// Profiling data. Times are in milliseconds.
 /// @ingroup world
 typedef struct b3Profile
 {
-	float step;
-	float pairs;
-	float collide;
-	float solve;
-	float solverSetup;
-	float constraints;
-	float prepareConstraints;
-	float integrateVelocities;
-	float warmStart;
-	float solveImpulses;
-	float integratePositions;
-	float relaxImpulses;
-	float applyRestitution;
-	float storeImpulses;
-	float splitIslands;
-	float transforms;
-	float sensorHits;
-	float jointEvents;
-	float hitEvents;
-	float refit;
-	float bullets;
-	float sleepIslands;
-	float sensors;
+	float step;				   //
+	float pairs;			   //
+	float collide;			   //
+	float solve;			   //
+	float solverSetup;		   //
+	float constraints;		   //
+	float prepareConstraints;  //
+	float integrateVelocities; //
+	float warmStart;		   //
+	float solveImpulses;	   //
+	float integratePositions;  //
+	float relaxImpulses;	   //
+	float restitution;		   //
+	float storeImpulses;	   //
+	float splitIslands;		   //
+	float transforms;		   //
+	float sensorHits;		   //
+	float jointEvents;		   //
+	float hitEvents;		   //
+	float refit;			   //
+	float bullets;			   //
+	float sleepIslands;		   //
+	float sensors;			   //
 } b3Profile;
 
 /// Counters that give details of the simulation size.
 /// @ingroup world
 typedef struct b3Counters
 {
-	int bodyCount;
-	int shapeCount;
-	int contactCount;
-	int jointCount;
-	int islandCount;
-	int stackUsed;
-	int arenaCapacity;
-	int staticTreeHeight;
-	int treeHeight;
-	int satCallCount;
-	int satCacheHitCount;
-	int byteCount;
-	int taskCount;
-	int colorCounts[24];
-	int manifoldCounts[B3_CONTACT_MANIFOLD_COUNT_BUCKETS];
+	int64_t byteCount;									   //
+	int bodyCount;										   //
+	int shapeCount;										   //
+	int contactCount;									   //
+	int jointCount;										   //
+	int islandCount;									   //
+	int stackUsed;										   //
+	int arenaCapacity;									   //
+	int staticTreeHeight;								   //
+	int treeHeight;										   //
+	int satCallCount;									   //
+	int satCacheHitCount;								   //
+	int taskCount;										   //
+	int colorCounts[24];								   //
+	int manifoldCounts[B3_CONTACT_MANIFOLD_COUNT_BUCKETS]; //
 
 	/// Number of contacts touched by the collide pass
 	/// graph contacts + awake-set non-touching
-	int awakeContactCount;
+	int awakeContactCount; //
 
 	/// Number of contacts recycled in the most recent step.
 	int recycledContactCount;
 
-	/// Maximum number of time of impact iterations
+	/// Maximum number of time of impact outer iterations
 	int distanceIterations;
+
+	/// Maximum TOI push backs.
 	int pushBackIterations;
+
+	/// Maximum TOI root solver iterations.
 	int rootIterations;
 } b3Counters;
-//! @endcond
 
 /// Joint type enumeration. This is useful because all joint types use b3JointId and sometimes you
 /// want to get the type of a joint.
@@ -912,7 +929,9 @@ typedef struct b3SphericalJointDef
 	/// The maximum motor torque, typically in newton-meters. Non-negative number.
 	float maxMotorTorque;
 
-	/// The desired motor angular velocity in radians per second.
+	/// The desired motor angular velocity in radians per second. This is the relative angular
+	/// velocity between the two bodies in world space.
+	/// motorVelocity = angularVelocityB - angularVelocityA
 	b3Vec3 motorVelocity;
 } b3SphericalJointDef;
 
@@ -1620,31 +1639,31 @@ typedef enum b3TOIState
 	b3_toiStateSeparated
 } b3TOIState;
 
-/// Time of impact output
+/// Time of impact output.
 typedef struct b3TOIOutput
 {
-	/// The type of result
+	/// The type of result.
 	b3TOIState state;
 
-	/// The hit point
+	/// The hit point. A shared point if overlapped.
 	b3Vec3 point;
 
-	/// The hit normal
+	/// The hit normal. Zero if overlapped.
 	b3Vec3 normal;
 
-	/// The sweep time of the collision
+	/// The sweep time of the collision. 0 if overlapped.
 	float fraction;
 
-	/// The final distance
+	/// The final distance. 0 if overlapped.
 	float distance;
 
-	/// Number of outer iterations
+	/// Number of outer iterations.
 	int distanceIterations;
 
-	/// Total number of push back iterations
+	/// Total number of push back iterations.
 	int pushBackIterations;
 
-	/// Total number of root iterations
+	/// Total number of root iterations.
 	int rootIterations;
 
 	/// Indicates that the time of impact detected initial
@@ -1673,58 +1692,46 @@ typedef struct b3TOIOutput
  * @{
  */
 
-/// Flags for tree nodes. For internal usage.
-typedef enum b3TreeNodeFlags
-{
-	b3_allocatedNode = 0x0001,
-	b3_enlargedNode = 0x0002,
-	b3_leafNode = 0x0004,
-} b3TreeNodeFlags;
-
-/// Tree node child indices. For internal usage.
-typedef struct b3TreeNodeChildren
-{
-	int child1; ///< child node index 1
-	int child2; ///< child node index 2
-} b3TreeNodeChildren;
-
-/// A node in the dynamic tree. This is private data placed here for performance reasons.
-/// todo test padding to 64 bytes to avoid straddling cache lines
+/// A node in the dynamic tree. Siblings sit together at an even index so two nodes fit in
+/// a 64 byte cache line. The root is at index zero and index one always empty.
 typedef struct b3TreeNode
 {
 	/// The node bounding box
 	b3AABB aabb; // 24
 
-	/// Category bits for collision filtering
-	uint64_t categoryBits; // 8
+	/// bit 31 : 1 for leaf node
+	/// bit 30 : 1 for moved flag
+	/// bits 0-29 : index of the sibling pair node or the proxy id for a leaf
+	uint32_t flagIndex; // 4
 
 	union
 	{
-		/// Children (internal node)
-		b3TreeNodeChildren children;
+		/// The height of an internal node. A leaf has zero height.
+		int32_t height;
 
-		/// User data (leaf node)
-		uint64_t userData;
-	}; // 8
-
-	union
-	{
-		/// The node parent index (allocated node)
-		int parent;
-
-		/// The node freelist next index (free node)
-		int next;
+		/// The shape index for a leaf. Truncated from proxy user data.
+		int32_t shapeIndex;
 	}; // 4
-
-	/// Height of the node. Leaves have a height of 0.
-	uint16_t height; // 2
-
-	/// @see b3TreeNodeFlags
-	uint16_t flags; // 2
 } b3TreeNode;
 
+/// Separate storage for tree leaves.
+typedef struct b3TreeProxy
+{
+	/// User data is an index instead of void* because it is used internally as a shape index.
+	uint64_t userData;
+
+	/// Category bits for collision filtering.
+	uint64_t categoryBits;
+
+	/// The leaf node. B3_NULL_INDEX for a free proxy.
+	int32_t node;
+
+	/// Next free proxy.
+	int32_t next;
+} b3TreeProxy;
+
 /// Dynamic tree version for compatibility testing.
-#define B3_DYNAMIC_TREE_VERSION 0x93EDAF889FD30B4Aull
+#define B3_DYNAMIC_TREE_VERSION 0x1D6F4C2A73B80E91ull
 
 /// The dynamic tree structure. This should be considered private data.
 /// It is placed here for performance reasons.
@@ -1734,26 +1741,42 @@ typedef struct b3DynamicTree
 	/// if the tree is serialized.
 	uint64_t version;
 
-	/// The tree nodes
+	/// Array of nodes. The root is at index zero and index 1 is empty.
+	/// Otherwise siblings are paired at even indices. Has holes for free node pairs.
 	b3TreeNode* nodes;
 
-	/// The root index
-	int root;
+	/// Parent index per node. The free list is interweaved.
+	int32_t* parents;
 
-	/// The number of nodes
-	int nodeCount;
+	/// Proxy data split from node array as cold data.
+	b3TreeProxy* proxies;
+
+	/// Every allocated node has a lower index than this.
+	int32_t nodeEnd;
 
 	/// The allocated node space
-	int nodeCapacity;
+	int32_t nodeCapacity;
+
+	/// Free pairs below nodeEnd
+	int32_t pairFreeList;
 
 	/// Number of proxies created
-	int proxyCount;
+	int32_t proxyCount;
 
-	/// Node free list
-	int freeList;
+	/// The allocated proxy space
+	int32_t proxyCapacity;
+
+	/// Proxy free list
+	int32_t proxyFreeList;
+
+	/// Array of nodes for rebuild.
+	b3TreeNode* swapNodes;
 
 	/// Leaf indices for rebuild
-	int* leafIndices;
+	int32_t* leafIndices;
+
+	/// Leaves for the rebuild. May represent a proxy or a retained subtree.
+	b3TreeNode* leafNodes;
 
 	/// Leaf bounding boxes for rebuild
 	b3AABB* leafBoxes;
@@ -1762,10 +1785,14 @@ typedef struct b3DynamicTree
 	b3Vec3* leafCenters;
 
 	/// Bins for sorting during rebuild
-	int* binIndices;
+	int32_t* binIndices;
 
 	/// Allocated space for rebuilding
-	int rebuildCapacity;
+	int32_t rebuildCapacity;
+
+	/// Rebuild orders the nodes so the children follow parents. Cache friendly for queries
+	/// and refitting. The order can be disrupted by proxy creation.
+	bool dfsOrdered;
 } b3DynamicTree;
 
 /// These are performance results returned by dynamic tree queries.
@@ -1817,6 +1844,15 @@ typedef struct b3PlaneResult
 	/// Closest point on the shape. May not be unique.
 	b3Vec3 point;
 
+	/// The index of the mesh or height field triangle hit.
+	int triangleIndex;
+
+	/// The index of the compound child shape.
+	int childIndex;
+
+	/// The material index.
+	int materialIndex;
+
 } b3PlaneResult;
 
 /// These are collision planes that can be fed to b3SolvePlanes. Normally
@@ -1856,6 +1892,22 @@ typedef struct b3BodyPlaneResult
 	/// The plane result.
 	b3PlaneResult result;
 } b3BodyPlaneResult;
+
+/// Body time of impact result for movers.
+typedef struct b3BodyTOIResult
+{
+	/// The hit point in world space.
+	b3Pos point;
+
+	/// The hit normal. Points from the body to the mover.
+	b3Vec3 normal;
+
+	/// The sweep time of the collision.
+	float fraction;
+
+	/// The hit shape.
+	b3ShapeId shapeId;
+} b3BodyTOIResult;
 
 /// Used to collect collision planes for character movers.
 /// Return true to continue gathering planes.
@@ -1912,8 +1964,7 @@ typedef struct b3Sphere
  * @{
  */
 
-/// A solid capsule can be viewed as two hemispheres connected
-/// by a rectangle.
+/// A solid capsule can be viewed as two hemispheres connected by a cylinder.
 typedef struct b3Capsule
 {
 	/// Local center of the first hemisphere
@@ -2068,7 +2119,10 @@ typedef struct b3MeshDef
 	/// Triangle vertices.
 	b3Vec3* vertices;
 
-	/// Triangle vertex indices. 3 for each triangle. CCW winding.
+	/// Stride between vertices. Use 0 for contiguous vertices.
+	size_t stride;
+
+	/// Triangle vertex indices. 3 for each triangle. CCW winding unless CW is indicated below.
 	int32_t* indices;
 
 	/// Triangle material index. 1 per triangle. Indexes into b3ShapeDef::materials.
@@ -2094,6 +2148,9 @@ typedef struct b3MeshDef
 
 	/// Compute triangle adjacency information using shared edges
 	bool identifyEdges;
+
+	/// Input indices have clockWise winding order.
+	bool clockWiseWinding;
 } b3MeshDef;
 
 /// 64-bit mesh version. Useful for validating serialized data.
@@ -2424,11 +2481,7 @@ typedef struct b3CompoundDef
 } b3CompoundDef;
 
 /// The baked compound version depends on the tree, mesh, and hull versions.
-#define B3_COMPOUND_VERSION ( 0xB11DCE70FAD5622Bull ^ B3_DYNAMIC_TREE_VERSION ^ B3_MESH_VERSION ^ B3_HULL_VERSION )
-
-/// Meshes used in compounds have limited space for materials. If you have
-/// a mesh with many materials, you can use it outside of the compound.
-#define B3_MAX_COMPOUND_MESH_MATERIALS 4
+#define B3_COMPOUND_VERSION ( 0x7A2F41C9E6D0B358ull ^ B3_DYNAMIC_TREE_VERSION ^ B3_MESH_VERSION ^ B3_HULL_VERSION )
 
 /// The data for a baked compound shape. This is a potentially large yet highly optimized
 /// data structure. It can contain thousands of child shapes, yet at runtime it populates
@@ -2448,7 +2501,11 @@ typedef struct b3CompoundData
 	/// Offset of the tree node array in bytes from the struct address.
 	int nodeOffset;
 
-	/// Immutable dynamic tree. The tree node pointer must be fixed up using the node offset
+	/// Offset of the tree proxy array in bytes from the struct address.
+	int proxyOffset;
+
+	/// Immutable dynamic tree. The node and proxy pointers must be fixed up using the offsets
+	/// above. A baked tree is never inserted into, so the parent array stays null.
 	b3DynamicTree tree;
 
 	/// Offset of the material array in bytes from the struct address.
@@ -2495,7 +2552,10 @@ typedef struct b3CompoundCapsule
 	b3Capsule capsule;
 
 	/// Index to a shared material.
-	int materialIndex;
+	uint16_t materialIndex;
+
+	/// Padding for determinism.
+	uint16_t padding;
 } b3CompoundCapsule;
 
 /// A hull that lives in a compound.
@@ -2508,7 +2568,10 @@ typedef struct b3CompoundHull
 	b3Transform transform;
 
 	/// Index to a shared material.
-	int materialIndex;
+	uint16_t materialIndex;
+
+	/// Padding for determinism.
+	uint16_t padding;
 } b3CompoundHull;
 
 /// A mesh with non-uniform scale that lives in a compound.
@@ -2524,10 +2587,12 @@ typedef struct b3CompoundMesh
 	b3Vec3 scale;
 
 	/// This is used to access the surface material from b3GetCompoundMaterials.
-	/// Requires an extra level of indirection. The triangle material index
-	/// is clamped to B3_MAX_COMPOUND_MESH_MATERIALS.
+	/// Requires an extra level of indirection.
 	/// materialIndex = materialIndices[triangle->materialIndex]
-	int materialIndices[B3_MAX_COMPOUND_MESH_MATERIALS];
+	const uint16_t* materialIndices;
+
+	/// The number of materials. 1 for convex hapes.
+	int materialCount;
 } b3CompoundMesh;
 
 /// A sphere that lives in a compound.
@@ -2537,7 +2602,10 @@ typedef struct b3CompoundSphere
 	b3Sphere sphere;
 
 	/// Index to a shared material.
-	int materialIndex;
+	uint16_t materialIndex;
+
+	/// Padding for determinism.
+	uint16_t padding;
 } b3CompoundSphere;
 
 /// Child shape of a compound
@@ -2556,8 +2624,11 @@ typedef struct b3ChildShape
 	b3Transform transform;
 
 	/// Material indices. Index 0 is used for convex shapes.
-	/// todo limit to 64K?
-	int materialIndices[B3_MAX_COMPOUND_MESH_MATERIALS];
+	const uint16_t* materialIndices;
+
+	/// The number of materials. This is one for convex shapes. For
+	/// meshes it is determined by the maximum triangle material index.
+	int materialCount;
 
 	/// The shape type (union tag).
 	b3ShapeType type;
@@ -2592,20 +2663,22 @@ typedef struct b3ManifoldPoint
 	/// The separation of the contact point, negative if penetrating
 	float separation;
 
-	/// Cached separation used for contact recycling
-	float baseSeparation;
-
 	/// The impulse along the manifold normal vector. Since Box3D uses sub-stepping, this is
 	/// result from the final sub-step.
 	float normalImpulse;
 
-	/// The total normal impulse applied during sub-stepping. This is important
+	/// The total normal impulse applied across sub-stepping and restitution. This is important
 	/// to identify speculative contact points that had an interaction in the time step.
+	/// This includes the warm starting impulse, the sub-step delta impulse, and the restitution
+	/// impulse.
 	float totalNormalImpulse;
 
-	/// Relative normal velocity pre-solve. Used for hit events. If the normal impulse is
-	/// zero then there was no hit. Negative means shapes are approaching.
+	/// Relative normal velocity pre-solve. Negative when approaching. This is only
+	/// computed if hit events are enabled.
 	float normalVelocity;
+
+	/// Cached separation used for contact recycling
+	float baseSeparation;
 
 	/// Local point for matching
 	/// Uniquely identifies a contact point between two shapes

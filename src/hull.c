@@ -8,6 +8,7 @@
 #include "algorithm.h"
 #include "math_internal.h"
 #include "shape.h"
+#include "simd.h"
 
 #include "box3d/collision.h"
 #include "box3d/constants.h"
@@ -1633,19 +1634,46 @@ int b3FindHullSupportVertex( const b3HullData* hull, b3Vec3 direction )
 	float bestDot = -FLT_MAX;
 
 	int vertexCount = hull->vertexCount;
-	const b3Vec3* points = b3GetHullPoints( hull );
+	const float* vx = b3GetHullSoaVertices( hull );
 
-	for ( int index = 0; index < vertexCount; ++index )
+	int soaVertexCount = ( vertexCount + 3 ) & ~3;
+	const float* vy = vx + soaVertexCount;
+	const float* vz = vy + soaVertexCount;
+
+	b3FloatW dx = b3SplatW( direction.x );
+	b3FloatW dy = b3SplatW( direction.y );
+	b3FloatW dz = b3SplatW( direction.z );
+	b3FloatW four = b3SplatW( 4.0f );
+	b3FloatW index = b3SetW( 0.0f, 1.0f, 2.0f, 3.0f );
+	b3FloatW bestDotW = b3SplatW( -FLT_MAX );
+	b3FloatW bestIndexW = b3SplatW( -1.0f );
+
+	for ( int i = 0; i < soaVertexCount; i += 4 )
 	{
-		float dot = b3Dot( direction, points[index] );
-		if ( dot > bestDot )
+		b3FloatW dot =
+			b3AddW( b3AddW( b3MulW( dx, b3LoadW( vx + i ) ), b3MulW( dy, b3LoadW( vy + i ) ) ), b3MulW( dz, b3LoadW( vz + i ) ) );
+		b3FloatW mask = b3GreaterThanW( dot, bestDotW );
+		bestDotW = b3BlendW( bestDotW, dot, mask );
+		bestIndexW = b3BlendW( bestIndexW, index, mask );
+		index = b3AddW( index, four );
+	}
+
+	_Alignas( 16 ) float dots[4];
+	_Alignas( 16 ) float indices[4];
+	b3StoreW( dots, bestDotW );
+	b3StoreW( indices, bestIndexW );
+
+	for ( int lane = 0; lane < 4; ++lane )
+	{
+		int laneIndex = (int)indices[lane];
+		if ( laneIndex >= 0 && ( dots[lane] > bestDot || ( dots[lane] == bestDot && laneIndex < bestIndex ) ) )
 		{
-			bestIndex = index;
-			bestDot = dot;
+			bestIndex = laneIndex;
+			bestDot = dots[lane];
 		}
 	}
-	B3_ASSERT( bestIndex >= 0 );
 
+	B3_ASSERT( 0 <= bestIndex && bestIndex < vertexCount );
 	return bestIndex;
 }
 
@@ -2655,7 +2683,7 @@ int b3CollideMoverAndHull( b3PlaneResult* result, const b3HullData* shape, const
 	if ( distanceOutput.distance <= totalRadius )
 	{
 		b3Plane plane = { distanceOutput.normal, totalRadius - distanceOutput.distance };
-		*result = (b3PlaneResult){ plane, distanceOutput.pointA };
+		*result = (b3PlaneResult){ plane, distanceOutput.pointA, 0, 0, 0 };
 		return 1;
 	}
 
@@ -2944,4 +2972,187 @@ b3BoxHull b3MakeScaledBoxHull( b3Vec3 halfWidths, b3Transform transform, b3Vec3 
 	b3Transform xf = transform;
 	b3ScaleBox( &h, &xf, postScale, 4.0f * B3_LINEAR_SLOP );
 	return b3MakeTransformedBoxHull( h.x, h.y, h.z, xf );
+}
+
+// 2D hull (Andrew's monotone chain)
+
+// cross(b - a, c - a)
+static inline float b3Cross2D( b3Vec2 a, b3Vec2 b, b3Vec2 c )
+{
+	return ( b.x - a.x ) * ( c.y - a.y ) - ( b.y - a.y ) * ( c.x - a.x );
+}
+
+// Iteratively remove the vertices contributing the least area.
+int b3SimplifyHull2D( b3Point2D* hull, int count1, int target )
+{
+	B3_ASSERT( target >= 3 );
+
+	if ( count1 <= 3 )
+	{
+		return count1;
+	}
+
+	float linearSlop = B3_LINEAR_SLOP;
+	float areaTol = 0.25f * linearSlop * linearSlop;
+	int count2 = count1;
+
+	for ( ;; )
+	{
+		float minArea = FLT_MAX;
+		int minIndex = 0;
+
+		for ( int i = 0; i < count2; i++ )
+		{
+			int prev = ( i + count2 - 1 ) % count2;
+			int next = ( i + 1 ) % count2;
+			float area = b3Cross2D( hull[prev].p, hull[i].p, hull[next].p );
+			B3_VALIDATE( area >= -FLT_EPSILON );
+
+			if ( area + areaTol < minArea )
+			{
+				minArea = area;
+				minIndex = i;
+			}
+		}
+
+		if ( count2 <= 3 || ( minArea > areaTol && count2 <= target ) )
+		{
+			break;
+		}
+
+		count2 -= 1;
+		if ( minIndex < count2 )
+		{
+			memmove( hull + minIndex, hull + ( minIndex + 1 ), ( count2 - minIndex ) * sizeof( b3Point2D ) );
+		}
+	}
+
+	return count2;
+}
+
+// Sort comparator: by x, then by y. Insertion since n is typically 20 or less.
+static void b3Sort2D( b3Point2D* pts, int count )
+{
+	for ( int i = 1; i < count; ++i )
+	{
+		b3Point2D base = pts[i];
+		int j = i - 1;
+		while ( j >= 0 && ( pts[j].p.x > base.p.x || ( pts[j].p.x == base.p.x && pts[j].p.y > base.p.y ) ) )
+		{
+			pts[j + 1] = pts[j];
+			j -= 1;
+		}
+		pts[j + 1] = base;
+	}
+}
+
+// Welds points that have been sorted O(n) time
+static int b3Weld2D( b3Point2D* pts, int count1 )
+{
+	if ( count1 <= 1 )
+	{
+		return count1;
+	}
+
+	float linearSlop = 0.25f * B3_LINEAR_SLOP;
+	float tolSqr = linearSlop * linearSlop;
+
+	int count2 = 1;
+	int baseIndex = 0;
+	for ( int i = 1; i < count1; i++ )
+	{
+		float distanceSqr = b3DistanceSquared2( pts[i].p, pts[baseIndex].p );
+		if ( distanceSqr < tolSqr )
+		{
+			if ( pts[i].originalIndex < pts[baseIndex].originalIndex )
+			{
+				pts[baseIndex] = pts[i];
+			}
+		}
+		else
+		{
+			pts[count2] = pts[i];
+			baseIndex = count2;
+			count2 += 1;
+		}
+	}
+
+	return count2;
+}
+
+// Andrew's monotone chain convex hull algorithm
+// hull must have space for 2 * count1 points
+int b3Hull2D( b3Point2D* pts, int count, b3Point2D* hull )
+{
+	int count1 = count;
+
+	if ( count1 <= 0 )
+	{
+		return 0;
+	}
+
+	if ( count1 == 1 )
+	{
+		hull[0] = pts[0];
+		return 1;
+	}
+
+	b3Sort2D( pts, count1 );
+	count1 = b3Weld2D( pts, count1 );
+
+	if ( count1 == 1 )
+	{
+		hull[0] = pts[0];
+		return 1;
+	}
+
+	if ( count1 == 2 )
+	{
+		hull[0] = pts[0];
+		hull[1] = pts[1];
+		return 2;
+	}
+
+	int count2 = 0;
+
+	for ( int i = 0; i < count1; i++ )
+	{
+		while ( count2 >= 2 )
+		{
+			float area = b3Cross2D( hull[count2 - 2].p, hull[count2 - 1].p, pts[i].p );
+			if ( area > 0.0f )
+			{
+				break;
+			}
+
+			count2 -= 1;
+		}
+
+		B3_VALIDATE( count2 < 2 * count1 );
+		hull[count2] = pts[i];
+		count2 += 1;
+	}
+
+	int lowerCount = count2 + 1;
+
+	for ( int i = count1 - 2; i >= 0; i-- )
+	{
+		while ( count2 >= lowerCount )
+		{
+			float area = b3Cross2D( hull[count2 - 2].p, hull[count2 - 1].p, pts[i].p );
+			if ( area > 0.0f )
+			{
+				break;
+			}
+
+			count2 -= 1;
+		}
+
+		B3_VALIDATE( count2 < 2 * count1 );
+		hull[count2] = pts[i];
+		count2 += 1;
+	}
+
+	B3_VALIDATE( hull[0].originalIndex == hull[count2 - 1].originalIndex );
+	return count2 - 1;
 }

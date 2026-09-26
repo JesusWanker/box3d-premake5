@@ -19,7 +19,7 @@ typedef enum b3ShapeFlags
 	b3_enableCustomFiltering = 0x04,
 	b3_enableHitEvents = 0x08,
 	b3_enablePreSolveEvents = 0x10,
-	b3_enlargedAABB = 0x20,
+	// 0x20 is free, it was the enlarged AABB flag before the broad-phase marked the tree
 	b3_enableSpeculative = 0x40,
 } b3ShapeFlags;
 
@@ -37,7 +37,6 @@ typedef struct b3Shape
 	float aabbMargin;
 
 	b3AABB aabb;
-	b3AABB fatAABB;
 	b3Vec3 localCentroid;
 
 	int materialCount;
@@ -74,7 +73,7 @@ static inline b3SurfaceMaterial* b3GetShapeMaterials( const b3Shape* shape )
 	return shape->materials != NULL ? shape->materials : (b3SurfaceMaterial*)&shape->material;
 }
 
-void b3CreateShapeProxy( b3Shape* shape, b3BroadPhase* bp, b3BodyType type, b3WorldTransform transform, bool forcePairCreation );
+void b3CreateShapeProxy( b3World* world, b3Shape* shape, b3BodyType type, b3WorldTransform transform, bool forcePairCreation );
 void b3DestroyShapeProxy( b3Shape* shape, b3BroadPhase* bp );
 
 void b3DestroyShapeAllocations( b3World* world, b3Shape* shape );

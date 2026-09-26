@@ -1011,9 +1011,24 @@ static int EmptyWorldRoundTrip( void )
 	return 0;
 }
 
+// Safety factor of the named body in a replay world, or -1 if the body is not in the list
+static float ReplaySafetyFactor( b3RecPlayer* player, const char* name )
+{
+	int count = b3RecPlayer_GetBodyCount( player );
+	for ( int i = 0; i < count; ++i )
+	{
+		b3BodyId bodyId = b3RecPlayer_GetBodyId( player, i );
+		if ( b3Body_IsValid( bodyId ) && strcmp( b3Body_GetName( bodyId ), name ) == 0 )
+		{
+			return b3Body_GetSafetyFactor( bodyId );
+		}
+	}
+
+	return -1.0f;
+}
+
 // Exercise every recorded op in a single session, then validate replay at two worker
-// counts, round-trip through a file, and drive the incremental player. Mirrors the
-// comprehensive RecordingTest in Box2D's test suite (box2d/test/test_recording.c).
+// counts, round-trip through a file, and drive the incremental player.
 static int AllOps( void )
 {
 	b3Recording* rec = b3CreateRecording( 0 );
@@ -1139,10 +1154,30 @@ static int AllOps( void )
 	b3CompoundSphereDef compSphere;
 	compSphere.sphere = (b3Sphere){ { 0.0f, 0.0f, 0.0f }, 1.0f };
 	compSphere.material = b3DefaultSurfaceMaterial();
+
+	// Mesh child with five materials so the compound material map is recorded
+	b3MeshData* compoundMeshData = b3CreateGridMesh( 1, 5, 1.0f, 5, false );
+	ENSURE( compoundMeshData != NULL );
+	ENSURE( compoundMeshData->materialCount == 5 );
+	b3SurfaceMaterial compoundMeshMaterials[5];
+	for ( int i = 0; i < 5; ++i )
+	{
+		compoundMeshMaterials[i] = b3DefaultSurfaceMaterial();
+	}
+	b3CompoundMeshDef compMesh;
+	memset( &compMesh, 0, sizeof( compMesh ) );
+	compMesh.meshData = compoundMeshData;
+	compMesh.transform = b3Transform_identity;
+	compMesh.scale = (b3Vec3){ 1.0f, 1.0f, 1.0f };
+	compMesh.materials = compoundMeshMaterials;
+	compMesh.materialCount = 5;
+
 	b3CompoundDef compoundDef;
 	memset( &compoundDef, 0, sizeof( compoundDef ) );
 	compoundDef.spheres = &compSphere;
 	compoundDef.sphereCount = 1;
+	compoundDef.meshes = &compMesh;
+	compoundDef.meshCount = 1;
 	b3CompoundData* compound = b3CreateCompound( &compoundDef );
 	ENSURE( compound != NULL );
 	b3ShapeDef compoundShapeDef = b3DefaultShapeDef();
@@ -1229,11 +1264,27 @@ static int AllOps( void )
 	b3BodyDef disableDef = b3DefaultBodyDef();
 	disableDef.type = b3_dynamicBody;
 	disableDef.position = (b3Pos){ 9.0f, 5.0f, 0.0f };
+	disableDef.name = "dropBody";
 	b3BodyId disableId = b3CreateBody( worldId, &disableDef );
 	b3Sphere disableSphere = { { 0.0f, 0.0f, 0.0f }, 0.3f };
 	b3CreateSphereShape( disableId, &sphereShapeDef, &disableSphere );
 	b3Body_Disable( disableId );
 	b3Body_Enable( disableId );
+	b3Body_SetSafetyFactor( disableId, 0.25f );
+
+	// A body that falls fast enough to stay on the continuous path for the whole session. The
+	// non-default factor is what proves the widened body def payload round-trips, since every
+	// other body records the default. Named so the replay check can find it.
+	b3BodyDef fastDef = b3DefaultBodyDef();
+	fastDef.type = b3_dynamicBody;
+	fastDef.position = (b3Pos){ -14.0f, 30.0f, 0.0f };
+	fastDef.linearVelocity = (b3Vec3){ 0.0f, -8.0f, 0.0f };
+	fastDef.safetyFactor = 0.1f;
+	fastDef.name = "fastBody";
+	b3BodyId fastId = b3CreateBody( worldId, &fastDef );
+	ENSURE( b3Body_GetSafetyFactor( fastId ) == 0.1f );
+	b3BoxHull fastBox = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	b3CreateHullShape( fastId, &sphereShapeDef, &fastBox.base );
 
 	// Force/impulse/torque (Vec3 args in 3D)
 	b3Body_ApplyForce( bodyId, (b3Vec3){ 0.0f, 50.0f, 0.0f }, (b3Pos){ 1.0f, 6.0f, 0.0f }, true );
@@ -1408,6 +1459,8 @@ static int AllOps( void )
 	b3World_EnableWarmStarting( worldId, true );
 	b3World_EnableSpeculative( worldId, true );
 	b3World_SetRestitutionThreshold( worldId, 1.5f );
+	b3World_SetRestitutionIterations( worldId, 3 );
+	b3World_EnableRestitutionPropagation( worldId, true );
 	b3World_SetHitEventThreshold( worldId, 2.0f );
 	b3World_SetContactTuning( worldId, 30.0f, 10.0f, 3.0f );
 	b3World_SetContactRecycleDistance( worldId, 0.05f );
@@ -1446,6 +1499,7 @@ static int AllOps( void )
 		{
 			b3Body_ApplyLinearImpulseToCenter( capsuleBodyId, (b3Vec3){ 2.0f, 0.0f, 0.0f }, true );
 			b3Body_SetGravityScale( bodyId, 1.0f );
+			b3Body_SetSafetyFactor( fastId, 0.4f );
 		}
 
 		// Issue queries mid-loop to exercise recording across steps
@@ -1467,6 +1521,7 @@ static int AllOps( void )
 	b3DestroyMesh( swapMeshData );
 	b3DestroyHeightField( hf );
 	b3DestroyCompound( compound );
+	b3DestroyMesh( compoundMeshData );
 
 	const uint8_t* recData = b3Recording_GetData( rec );
 	int recSize = b3Recording_GetSize( rec );
@@ -1528,6 +1583,26 @@ static int AllOps( void )
 		}
 		ENSURE( frames2 == 12 );
 		ENSURE( b3RecPlayer_HasDiverged( player ) == false );
+
+		b3DestroyPlayer( player );
+	}
+
+	// The state hash only proves the op stream stayed aligned. Read the safety factor back out of
+	// the replay world so a value that is written but never restored is caught too.
+	{
+		b3RecPlayer* player = b3CreatePlayer( recData, recSize, 1 );
+		ENSURE( player != NULL );
+
+		// Frame 0 replays the pre-step creates, so the def value is in place
+		ENSURE( b3RecPlayer_StepFrame( player ) );
+		ENSURE( ReplaySafetyFactor( player, "fastBody" ) == 0.1f );
+		ENSURE( ReplaySafetyFactor( player, "dropBody" ) == 0.25f );
+
+		// The setter is injected at frame 6
+		while ( b3RecPlayer_StepFrame( player ) )
+		{
+		}
+		ENSURE( ReplaySafetyFactor( player, "fastBody" ) == 0.4f );
 
 		b3DestroyPlayer( player );
 	}
